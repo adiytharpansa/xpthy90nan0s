@@ -1,4 +1,12 @@
 # Robot penyalin judul untuk GitHub Actions (berjalan di runner, token repo sendiri).
+# v5.4 (31 Okt 2026): push_episode DIPECAH per potongan (maks ~250 MB per push,
+# playlist.m3u8 SELALU di potongan terakhir) — satu push tunggal film utuh
+# (166-172 potongan, >2 GB) ditolak GitHub HTTP 500/RPC failed 5/5 (terbukti
+# Scarlet & Neon Genesis Evangelion: The End of Evangelion). Push terpotong
+# aman dilanjutkan: entri episode yang sudah ada di repo dibaca dulu (resume).
+# v5.3 (31 Okt 2026): rotasi kandidat menembus kegagalan segmen (percobaan
+# ulang episode memakai kandidat terverifikasi berikutnya), probing kandidat
+# paralel (maks 6), putaran ambil segmen 3 -> 4. Selebihnya identik v5.2:
 # v5.2 (31 Okt 2026): unggah via GIT PUSH dengan commit-tree — pohon baru dibangun
 # hanya di jalur berkas yang berubah (hash-object + mktree + commit-tree), TANPA
 # indeks repo. Pelajaran probe v5 (30 Okt 2026): git add/commit di atas indeks
@@ -103,23 +111,26 @@ def resolve_source(slug_id, num, skip=0):
         for x in (s.get('sources') or []):
             if x.get('url'): cands.append((x['url'], ref))
     cands.sort(key=lambda c: 0 if 'nexabloom' in c[0] else 1)
-    cands_ok = []
-    for u, ref in cands:
+    def probe(cand):
+        u, ref = cand
         raw = fetch_raw_smart(u, ref, tries=2)
         if not raw or not raw.decode('utf-8', 'replace').lstrip().startswith('#EXTM3U'):
-            continue
+            return None
         master = raw.decode('utf-8', 'replace')
         parsed = parse_variant(master, u, ref)
-        if not parsed: continue
+        if not parsed: return None
         pl, pl_base, durs, segs = parsed
-        if 0 < sum(durs) < 600: continue  # playlist pendek (cuplikan), bukan episode utuh
+        if 0 < sum(durs) < 600: return None  # playlist pendek (cuplikan), bukan episode utuh
         # Uji segmen pertama & tengah: kandidat hanya diterima bila segmennya
         # benar-benar bisa diambil (playlist saja tidak cukup — kasus AoT).
-        ok = True
         for idx in {0, len(segs) // 2}:
             s_abs = resolve_ref(pl_base, segs[idx])
-            if not is_ts(fetch_segment(s_abs, ref)): ok = False; break
-        if ok: cands_ok.append((pl, pl_base, durs, segs, ref))
+            if not is_ts(fetch_segment(s_abs, ref)): return None
+        return (pl, pl_base, durs, segs, ref)
+    # Probing paralel; ex.map menjaga urutan hasil = urutan kandidat (deterministik).
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        probed = list(ex.map(probe, cands))
+    cands_ok = [p for p in probed if p]
     if not cands_ok: return None
     return cands_ok[skip % len(cands_ok)]
 
@@ -137,32 +148,42 @@ def resolve_ref(base_url, line):
 
 def is_ts(data): return bool(data) and len(data) > 188 and data[0] == 0x47
 
-def download_episode(slug_id, num, outdir):
-    got = None
-    for attempt in range(3):
-        got = resolve_source(slug_id, num, skip=attempt)
-        if got: break
-        log(f'  ep{num}: resolusi kosong (coba {attempt + 1}/3)'); time.sleep(10)
-    if not got: return False
-    pl, pl_base, durs, segs, referer = got
+def download_episode(slug_id, num, outdir, start_skip=0):
     os.makedirs(outdir, exist_ok=True)
-    def grab(i):
-        path = os.path.join(outdir, f'seg-{i:03d}.ts')
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            with open(path, 'rb') as f: head = f.read(1)
-            if head == b'\x47': return True
-        s_abs = resolve_ref(pl_base, segs[i])
-        for rnd in range(3):
-            data = fetch_segment(s_abs, referer)
-            if is_ts(data):
-                with open(path, 'wb') as f: f.write(data)
-                return True
-            time.sleep(2 + rnd * 3)
-        return False
-    with ThreadPoolExecutor(max_workers=16) as ex:
-        results = list(ex.map(grab, range(len(segs))))
-    if not all(results):
-        log(f'  ep{num}: segmen gagal {results.count(False)}'); return False
+    prev_base = None
+    results = None; durs = None; segs = None
+    for cand_try in range(3):
+        got = resolve_source(slug_id, num, skip=start_skip + cand_try)
+        if not got:
+            log(f'  ep{num}: resolusi kosong (coba {cand_try + 1}/3)'); time.sleep(10)
+            continue
+        pl, pl_base, durs, segs, referer = got
+        if prev_base is not None and pl_base != prev_base:
+            # Ganti kandidat = segmentasi berbeda; buang sisa segmen kandidat lama.
+            for fn in os.listdir(outdir):
+                if fn.startswith('seg-'):
+                    try: os.unlink(os.path.join(outdir, fn))
+                    except OSError: pass
+        prev_base = pl_base
+        def grab(i):
+            path = os.path.join(outdir, f'seg-{i:03d}.ts')
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                with open(path, 'rb') as f: head = f.read(1)
+                if head == b'\x47': return True
+            s_abs = resolve_ref(pl_base, segs[i])
+            for rnd in range(4):
+                data = fetch_segment(s_abs, referer)
+                if is_ts(data):
+                    with open(path, 'wb') as f: f.write(data)
+                    return True
+                time.sleep(2 + rnd * 3)
+            return False
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            results = list(ex.map(grab, range(len(segs))))
+        if all(results): break
+        log(f'  ep{num}: segmen gagal {results.count(False)} (kandidat {cand_try + 1}/3)')
+        results = None
+    if results is None: return False
     if sum(durs) < 600:
         log(f'  ep{num}: durasi hanya {sum(durs):.0f} dtk, ditolak'); return False
     # Potongan besar untuk runner: s.d. 45 dtk / 18 MB per berkas.
@@ -279,19 +300,46 @@ def push_commit(new_root_tree, msg):
     log('push gagal total'); sys.exit(4)
 
 def push_episode(ep):
-    """Satu episode = satu pohon episode + splice ke akar + commit-tree + push."""
+    """Satu episode = commit-tree + push, DIPECAH per potongan bila besar:
+    maks ~250 MB per push dan playlist.m3u8 selalu di potongan terakhir,
+    supaya episode film raksasa tidak ditolak GitHub (HTTP 500 push tunggal)
+    dan episode setengah jalan tidak pernah memajang playlist yatim."""
     edir = os.path.join(OUT, f'ep{ep}')
-    ep_entries = []
-    for fn in sorted(os.listdir(edir)):
-        r = git('hash-object', '-w', os.path.join(edir, fn), timeout=900)
-        if r.returncode != 0:
-            log('hash-object gagal', fn); sys.exit(4)
-        ep_entries.append({'mode': '100644', 'type': 'blob', 'sha': r.stdout.strip(), 'name': fn})
-    ep_tree = mktree(ep_entries)
-    root = splice(HEAD_NOW['sha'], [WID, f'ep{ep}'],
-                  {'mode': '040000', 'type': 'tree', 'sha': ep_tree})
-    commit = push_commit(root, f'{WID} episode {ep} (segmen HLS)')
-    log(f'  ep{ep} ter-push ({commit[:7]})')
+    files = [(fn, os.path.getsize(os.path.join(edir, fn))) for fn in sorted(os.listdir(edir))]
+    seg_files = [(fn, sz) for fn, sz in files if fn != 'playlist.m3u8']
+    pl_files = [fn for fn, sz in files if fn == 'playlist.m3u8']
+    # Entri episode yang SUDAH ada di repo (resume sesudah push terpotong).
+    acc = {}
+    r = git('ls-tree', '-z', f"{HEAD_NOW['sha']}:{WID}/ep{ep}", check=False)
+    if r.returncode == 0:
+        for rec in r.stdout.split('\0'):
+            if not rec: continue
+            meta, name = rec.split('\t', 1)
+            mode, typ, sha = meta.split(' ')
+            acc[name] = {'mode': mode, 'type': typ, 'sha': sha, 'name': name}
+    BATCH_MAX = 250 * 1024 * 1024
+    batches, cur, cur_sz = [], [], 0
+    for fn, sz in seg_files:
+        if fn in acc: continue
+        if cur and cur_sz + sz > BATCH_MAX:
+            batches.append(cur); cur, cur_sz = [], 0
+        cur.append(fn); cur_sz += sz
+    if cur or not batches: batches.append(cur)
+    commit = HEAD_NOW['sha']
+    for bi, batch in enumerate(batches):
+        last = bi == len(batches) - 1
+        todo = list(batch) + (pl_files if last else [])
+        if not todo and acc: continue
+        for fn in todo:
+            r = git('hash-object', '-w', os.path.join(edir, fn), timeout=900)
+            if r.returncode != 0:
+                log('hash-object gagal', fn); sys.exit(4)
+            acc[fn] = {'mode': '100644', 'type': 'blob', 'sha': r.stdout.strip(), 'name': fn}
+        ep_tree = mktree(list(acc.values()))
+        root = splice(HEAD_NOW['sha'], [WID, f'ep{ep}'],
+                      {'mode': '040000', 'type': 'tree', 'sha': ep_tree})
+        commit = push_commit(root, f'{WID} episode {ep} (segmen HLS)')
+        log(f'  ep{ep} ter-push potongan {bi + 1}/{len(batches)} ({commit[:7]})')
     shutil.rmtree(edir, ignore_errors=True)  # hemat disk runner
     return commit
 
@@ -319,7 +367,7 @@ def main():
         edir = os.path.join(OUT, f'ep{ep}')
         ok = False
         for attempt in range(6):
-            if download_episode(SLUG_ID, ep, edir): ok = True; break
+            if download_episode(SLUG_ID, ep, edir, start_skip=attempt): ok = True; break
             log(f'  ep{ep}: unduh belum utuh (percobaan {attempt + 1}/6)'); time.sleep(10)
         if not ok:
             log(f'EP{ep} GAGAL — berhenti (episode yang sudah selesai aman tersimpan di repo)'); sys.exit(3)
